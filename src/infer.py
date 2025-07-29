@@ -1,93 +1,74 @@
-# ----------------------------- infer.py (v5 – balanced) -----------------------------
+# ----------------------------- infer.py (v4) -----------------------------
 """
-Creates 2 files in output/
-    • visit_scores.csv   – visit-level anomaly score + flag
-    • sp_metrics.csv     – one row per Service Point + KPIs + Anomaly State
-The Isolation-Forest is *refit on the fly* with a symmetric feature set
-(includes inv_fill = 1-V_fill) so both over- and under-utilized SPs can
-be tagged.
+Üretir: output/sp_metrics.csv   (tek satır / Service Point)
+
+Sütun adları (gösterim-dostu)
+-----------------------------
+Service Point
+Visit Count
+Max Anomaly Score
+CAIv Ratio
+VOF %
+VUR %
+CVv Ratio
+PMRv Ratio
+GR p90 (kg/day)
+DtO (days)
+IG (days)
+CVgr Ratio
+Anomaly State      (Yes / No)
 """
-import argparse, yaml, numpy as np, pandas as pd
+import argparse, yaml, joblib, numpy as np, pandas as pd
 from pathlib import Path
-from sklearn.ensemble import IsolationForest
-from utils import load_features   # still handles NaN + scaling
+from utils import load_features
+from scipy.stats import zscore   # sadece NaN kontrolünde kullanılıyor
 
-# -----------------------------------------------------------------------------
-def fit_and_score(in_pq: str, n_est: int, contam: float):
-    """Fit IF on visit features (+ inv_fill) and return scored DataFrame."""
-    df_vis = pd.read_parquet(in_pq)
-
-    # ---------- add symmetric feature
-    df_vis["inv_fill"] = 1.0 - df_vis["V_fill"]
-    from scipy.stats import zscore
-    df_vis["abs_z_fill"] = np.abs(zscore(df_vis["V_fill"].fillna(0)))
-
-
-    feature_cols = [c for c in df_vis.columns
-                    if c not in ("service_point", "visit_date")]
-
-    # --------- NaN → median (robust)
-    med = df_vis[feature_cols].median(numeric_only=True)
-    X   = df_vis[feature_cols].fillna(med).values
-
-    mdl = IsolationForest(
-        n_estimators=n_est,
-        contamination=contam,
-        max_samples="auto",
-        bootstrap=True,
-        random_state=42,
-        n_jobs=-1,
-    ).fit(X)
+def score_visits(cfg, in_pq):
+    mdl = joblib.load(cfg["paths"]["model_out"])
+    df_vis, X = load_features(in_pq, fit_scaler=False)
 
     df_vis["anomaly_score"] = -mdl.score_samples(X)
-    thr = np.quantile(df_vis["anomaly_score"], 1 - contam)
+    q = 1 - cfg["iforest"]["contamination"]
+    thr = np.quantile(df_vis["anomaly_score"], q)
     df_vis["is_anomaly"] = (df_vis["anomaly_score"] >= thr).astype(int)
     return df_vis
 
-# -----------------------------------------------------------------------------
 def build_sp(df_vis: pd.DataFrame, contamination: float) -> pd.DataFrame:
     g = df_vis.groupby("service_point")
 
     df = pd.DataFrame({
-        "Service Point":     g.size().index,
-        "Visit Count":       g.size().values,
+        "Service Point": g.size().index,
+        "Visit Count":   g.size().values,
         "Max Anomaly Score": g["anomaly_score"].max().values,
-        "CAIv Ratio":        g["V_kg"].quantile(0.90) / g["capacity_kg"].first(),
-        "VOF %":             g["V_fill"].apply(lambda s: (s > 1).mean()*100),
-        "VUR %":             g["V_fill"].mean()*100,
-        "CVv Ratio":         g["V_kg"].std() / g["V_kg"].mean(),
-        "PMRv Ratio":        g["V_kg"].max() / g["V_kg"].mean(),
-        "GR p90 (kg/day)":   g["GR"].quantile(0.90),
-        "DtO (days)":        g["capacity_kg"].first() / g["GR"].median(),
-        "IG (days)":         g["VI"].max(),
-        "CVgr Ratio":        g["GR"].std() / g["GR"].mean(),
+        "CAIv Ratio":    g["V_kg"].quantile(0.90) / g["capacity_kg"].first(),
+        "VOF %":         g["V_fill"].apply(lambda s: (s > 1).mean()*100),
+        "VUR %":         g["V_fill"].mean()*100,
+        "CVv Ratio":     g["V_kg"].std() / g["V_kg"].mean(),
+        "PMRv Ratio":    g["V_kg"].max() / g["V_kg"].mean(),
+        "GR p90 (kg/day)": g["GR"].quantile(0.90),
+        "DtO (days)":      g["capacity_kg"].first() / g["GR"].median(),
+        "IG (days)":       g["VI"].max(),
+        "CVgr Ratio":      g["GR"].std() / g["GR"].mean(),
     })
 
+    # ML-tabanlı anomaly etiketi
     q = np.quantile(df["Max Anomaly Score"], 1 - contamination)
     df["Anomaly State"] = np.where(df["Max Anomaly Score"] >= q, "Yes", "No")
+
     return df
 
-# -----------------------------------------------------------------------------
-def main(in_pq: str, contam: float = 0.05, n_est: int = 400):
-    # 1. fit & score visits
-    df_vis = fit_and_score(in_pq, n_est, contam)
+def main(cfg, in_pq):
+    cfg = yaml.safe_load(open(cfg))
+    df_vis = score_visits(cfg, in_pq)
+
+    sp_df = build_sp(df_vis, cfg["iforest"]["contamination"])
     Path("output").mkdir(exist_ok=True)
-    df_vis.to_csv("output/visit_scores.csv", index=False)
-
-    # 2. aggregate to SP
-    sp_df = build_sp(df_vis, contam)
     sp_df.to_csv("output/sp_metrics.csv", index=False)
-    print("✅ visit_scores.csv and sp_metrics.csv written to /output")
+    print("✅  output/sp_metrics.csv yazıldı")
 
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--in_pq", default="data/processed/visits.parquet",
-                   help="Parquet generated by texnl_anomaly_etl.py")
-    p.add_argument("--contam", type=float, default=0.05,
-                   help="Contamination ratio (default 0.05)")
-    p.add_argument("--n_est", type=int, default=400,
-                   help="Number of trees (default 400)")
-    args = p.parse_args()
-
-    main(args.in_pq, args.contam, args.n_est)
+    p.add_argument("--cfg",   default="src/config.yml")
+    p.add_argument("--in_pq", default="data/processed/visits.parquet")
+    a = p.parse_args()
+    main(a.cfg, a.in_pq)
