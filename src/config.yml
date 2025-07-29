@@ -1,0 +1,7 @@
+paths:
+  train_matrix: data/processed/visits.parquet
+  model_out:    models/isolation_forest.pkl
+
+iforest:
+  n_estimators: 400
+  contamination: 0.05    # %5 kaydı anomali say

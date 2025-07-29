@@ -1,0 +1,8 @@
+pandas
+numpy
+scikit-learn
+openpyxl
+pyarrow
+tqdm
+pyyaml
+joblib
